@@ -1,11 +1,13 @@
 from codegen import *
 import analysis_engine as ae
-import gui
 import dependency as dep
+import conScan as con
 
 ### Global for listing all chunks of code for which we have tried to create a python wrapper.
 emuchunks = {}
 
+# List of basic block chunks to package for BB mode
+bbChunks = []
 class Packager(object):
     '''
         Packager does the work of getting a codegen object
@@ -22,7 +24,7 @@ class Packager(object):
         # List of Contiguous code we're interested in
         self.targetCode = []
         
-        self.codeobj = genwrapper(self.ui.text_input_box("Enter Class Name"))
+        self.codeobj = genwrapper('', isFunc)
         self.arch = self.engine.get_arch()
         self.codeobj.arch = self.arch
 
@@ -38,8 +40,20 @@ class Packager(object):
             This function is a wrapper for determining which convenience features can 
             be enabled during code generation.
         '''
+        c = con.convenienceScanner(self.engine)
         if (self.isFunc == True and self.codeobj.arch in ['x64', 'x86', 'arm']):
             self.codeobj.conPass['ret'] = True
+
+        args = None
+        if (self.isFunc):
+            if self.ui.yes_no_box("Attempt to automatically fill in function arguments?"):
+                args = c.argIdent(self.address, self.isFunc)
+                if args:
+                    self.codeobj.conPass['args'] = args
+
+
+        if not self.isFunc:
+            self.codeobj.conPass['unset_vars'] = c.uninit_vars(bbChunks) 
 
     def minimal_package_function(self, address=None):
         '''
@@ -61,6 +75,14 @@ class Packager(object):
         targetCode = self.engine.get_region_bytes(address=self.address)
         self.codeobj.add_data(targetCode[0], targetCode[1])
         self.codeobj.add_mmap(targetCode[0])
+
+    def minimal_package_bb(self, address=None):
+        if (address == None):
+            address = self.address
+        targetCode = self.engine.get_basic_block_bytes(address)
+        self.engine.mark_gathered_basic_block(address)
+
+        bbChunks.append(targetCode)
         
 
     def package_function(self):
@@ -68,6 +90,9 @@ class Packager(object):
             This method handles filling in as much relevant information as possible into our current instance of codeobj
             about the function to be emulated. It is a high-level encapsulation of multipe packaging and analysis methods.
         '''
+        self.codeobj.name = self.ui.text_input_box("Enter Class Name")
+        if not self.codeobj.name:
+            return 
         # Get the bare minimum required information.
         self.minimal_package_function()
 
@@ -86,7 +111,51 @@ class Packager(object):
 
         # Generate what we currently have and show the results
         self.codeobj.generate_class()
-        self.engine.bv.show_plain_text_report("Generated Code: %s" % self.codeobj.name, self.codeobj.final)
+        self.engine.display_info("Generated Code: %s" % self.codeobj.name, self.codeobj.final)
+        if not self.ui.qtAvailable:
+            self.ui.save_file(self.codeobj) 
+
+    def package_bb(self):
+        '''
+            This method adds an entry to bbChunks, which can be used later to 
+            generate a package containing only user-specified basic blocks.
+        '''
+        self.minimal_package_bb()
+
+
+    def generate_bb_code(self):
+        global bbChunks
+        if len(bbChunks) == 0:
+            self.ui.msgBox("Basic Block package list is empty!")
+            return
+        self.codeobj.name = self.ui.text_input_box("Enter Class Name")
+        if not self.codeobj.name:
+            return
+        # Set starting address to first basic block selected
+        self.codeobj.startaddr = bbChunks[0].keys()[0]
+
+        self.targetCode = bbChunks
+
+        self.resolve_dependencies()
+
+        self.convenience_passes()
+
+        self.update_codeobj()
+        
+        # Clean up our modifications
+        self.cleanup_basic_blocks()
+        bbChunks = []
+
+        self.codeobj.generate_class()
+        self.engine.display_info("Generated Code: %s" % self.codeobj.name, self.codeobj.final)
+
+        self.ui.save_file(self.codeobj)
+    
+    def cleanup_basic_blocks(self):
+        global bbChunks
+        for bb in bbChunks:
+            self.engine.clean_gathered_basic_block(bb.keys()[0])
+        
 
     def package_region(self):
         '''
@@ -171,11 +240,11 @@ class Packager(object):
         pagesize = self.engine.get_page_size()
         secs = []
         for ref in dataRefs: 
-            sections = self.engine.bv.get_sections_at(ref.address)
+            sections = [self.engine.find_section(ref.address)]
             secs += sections
-        for sec in secs:
-            self.codeobj.add_data(self.engine.read_bytes(sec.start, sec.length), sec.start)
-            self.codeobj.add_mmap(sec.start)
+        for sec_start, sec_end, sec_name in secs:
+            self.codeobj.add_data(self.engine.read_bytes(sec_start, sec_end - sec_start), sec_start)
+            self.codeobj.add_mmap(sec_start)
 
     def map_minimal_data(self, dataRefs):
         '''
@@ -200,12 +269,12 @@ class Packager(object):
 
     def resolve_codeRefs(self, coderefs):
         for ref in coderefs:
-            print "Found CodeRef: %s::%s" % (ref.address, ref.type)
+            print "Found CodeRef: %x::%s" % (ref.address, ref.type)
             if (ref.type == 'call'):
                 self.minimal_package_function(address=ref.address)
-                self.resolve_dependencies(address=ref.address)
+                self.resolve_dependencies(address=ref.address, isFunc=True)
 
-    def resolve_dependencies(self, address=None):
+    def resolve_dependencies(self, address=None, isFunc=None):
         '''
             This method is a high-level wrapper for finding data our target code depends on.
         '''
@@ -213,13 +282,21 @@ class Packager(object):
         if (address == None):
             address = self.address 
 
+        if (isFunc == None):
+            isFunc = self.isFunc
+
         print "Resolving Dependencies for %x" % address
-        if (self.isFunc == True):
-            coderefs = resolv.branchScan(address)
+        if isFunc:
+            coderefs = resolv.branchScan(address, self.isFunc)
             datarefs = resolv.dataScan(address)
+        else:
+            datarefs = resolv.dataScan(address)
+            coderefs = []
+            for bb in bbChunks:
+                coderefs += resolv.branchScan(bb.keys()[0], self.isFunc) 
 
         if (resolv.impCalls != []):
-            self.resolve_imported_calls(resolv)        
+            self.resolve_imported_calls(resolv) 
 
         if (coderefs != []):
             if (self.ui.yes_no_box("Target code may depend on outside code, attempt to map automatically?") == True):
